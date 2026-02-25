@@ -58,14 +58,18 @@ class WhisperSTT(STTEngine):
                 compute_type = "int8"
 
         logger.info(
-            f"Loading Whisper '{self._model_size}' on {device} ({compute_type})..."
+            f"Loading Whisper '{self._model_size}' on {device} ({compute_type})... "
+            f"This may take a few minutes on first run (model download)."
         )
         self._model = WhisperModel(
             self._model_size,
             device=device,
             compute_type=compute_type,
         )
-        logger.info(f"Whisper '{self._model_size}' loaded on {device}.")
+        logger.info(
+            f"✓ Whisper '{self._model_size}' loaded on {device} ({compute_type}). "
+            f"Ready for speech recognition."
+        )
 
     def transcribe(
         self,
@@ -87,6 +91,14 @@ class WhisperSTT(STTEngine):
             audio_float = audio_data.astype(np.float32)
         else:
             audio_float = audio_data.astype(np.float32)
+
+        # Log audio quality info for debugging
+        duration = len(audio_float) / sample_rate
+        rms = float(np.sqrt(np.mean(audio_float ** 2)))
+        logger.debug(
+            f"[Whisper] Input: {duration:.1f}s, RMS={rms:.4f}, "
+            f"model={self._model_size}, lang={language}"
+        )
 
         # Map language codes
         whisper_lang = {"en": "en", "uk": "uk"}.get(language)

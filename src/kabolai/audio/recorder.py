@@ -1,11 +1,9 @@
-"""Microphone audio capture with silence detection and continuous listening.
+"""Microphone audio capture with auto-calibration and continuous listening.
 
-Supports two modes:
-- Push-to-talk: record() — records when called, stops on silence
-- Continuous: start_continuous() — always listens, calls callback when speech detected
-
-Key feature: Pre-buffer keeps ~0.5s of audio BEFORE speech starts, so the
-beginning of words isn't cut off (prevents "youtube" → "your top").
+Key features:
+- Auto-calibrate: measures ambient noise on first use, sets threshold dynamically
+- Pre-buffer: keeps ~0.5s of audio BEFORE speech starts (prevents cutting words)
+- Interrupt-friendly: continuous mode detects speech even while pipeline is busy
 """
 
 import collections
@@ -27,18 +25,23 @@ logger = logging.getLogger(__name__)
 MIN_SPEECH_DURATION = 0.3
 
 # Pre-buffer: keep this many seconds of audio before speech starts
-# This prevents cutting off the beginning of words
 PRE_BUFFER_DURATION = 0.5
 
 # Cooldown after processing (seconds) to avoid hearing the TTS response
 POST_SPEECH_COOLDOWN = 1.0
 
+# Auto-calibration settings
+CALIBRATION_DURATION = 1.0  # seconds of ambient noise to record
+SPEECH_MULTIPLIER = 3.0     # speech threshold = ambient * this
+MIN_SPEECH_THRESHOLD = 100  # absolute minimum speech threshold
+
 
 class AudioRecorder:
-    """Records audio from microphone with voice activity detection.
+    """Records audio from microphone with auto-calibrated voice detection.
 
-    Supports push-to-talk mode (record()) and continuous listening mode
-    (start_continuous() / stop_continuous()).
+    On first use, records 1 second of ambient noise to calibrate the speech
+    detection threshold. This ensures continuous mode works regardless of
+    microphone sensitivity or background noise level.
     """
 
     def __init__(self, config: AudioConfig):
@@ -59,6 +62,73 @@ class AudioRecorder:
         self._on_speech_callback: Optional[Callable] = None
         self._cooldown_until: float = 0.0
 
+        # Auto-calibration
+        self._calibrated = False
+        self._ambient_rms: float = 0.0
+        self._speech_threshold: float = float(config.silence_threshold)
+
+        # Log audio device info
+        self._log_device_info()
+
+    def _log_device_info(self):
+        """Log which audio input device is being used."""
+        try:
+            default_idx = sd.default.device[0]
+            device = sd.query_devices(default_idx)
+            logger.info(
+                f"Audio input: [{default_idx}] {device['name']} "
+                f"(native {device['default_samplerate']:.0f}Hz, "
+                f"{device['max_input_channels']}ch, "
+                f"requesting {self.sample_rate}Hz {self.channels}ch)"
+            )
+        except Exception as e:
+            logger.warning(f"Could not query audio device: {e}")
+
+    def calibrate(self):
+        """Record ambient noise and auto-set speech detection threshold.
+
+        Should be called once during initialization. Measures the ambient
+        noise level and sets the threshold to SPEECH_MULTIPLIER times that.
+        """
+        logger.info(f"Calibrating microphone ({CALIBRATION_DURATION}s)...")
+        try:
+            audio = sd.rec(
+                int(self.sample_rate * CALIBRATION_DURATION),
+                samplerate=self.sample_rate,
+                channels=self.channels,
+                dtype="int16",
+            )
+            sd.wait()
+            audio = audio.flatten()
+
+            self._ambient_rms = float(np.sqrt(np.mean(audio.astype(np.float32) ** 2)))
+            self._speech_threshold = max(
+                MIN_SPEECH_THRESHOLD,
+                self._ambient_rms * SPEECH_MULTIPLIER,
+            )
+            self._calibrated = True
+
+            # Also update silence_threshold if our calibration gives a better value
+            # (use a lower multiplier for silence detection — 2x ambient)
+            calibrated_silence = max(80, self._ambient_rms * 2)
+            if self.silence_threshold > self._speech_threshold:
+                # Config threshold is too high, override with calibrated
+                old = self.silence_threshold
+                self.silence_threshold = self._speech_threshold
+                logger.info(
+                    f"Overriding silence_threshold: {old:.0f} → "
+                    f"{self.silence_threshold:.0f} (was higher than speech threshold)"
+                )
+
+            logger.info(
+                f"Calibration complete: ambient_rms={self._ambient_rms:.0f}, "
+                f"speech_threshold={self._speech_threshold:.0f}, "
+                f"silence_threshold={self.silence_threshold:.0f}"
+            )
+        except Exception as e:
+            logger.warning(f"Calibration failed: {e}. Using config threshold.")
+            self._speech_threshold = float(self.silence_threshold)
+
     def _audio_callback(self, indata, frames, time_info, status):
         """Callback for sounddevice InputStream."""
         if status:
@@ -69,6 +139,10 @@ class AudioRecorder:
 
     def record(self) -> Optional[np.ndarray]:
         """Record audio until silence is detected or max duration reached."""
+        # Auto-calibrate on first use
+        if not self._calibrated:
+            self.calibrate()
+
         self._is_recording = True
         self._audio_queue = queue.Queue()
         chunks = []
@@ -120,20 +194,25 @@ class AudioRecorder:
             return None
 
         audio = np.concatenate(chunks, axis=0).flatten()
-        logger.info(f"Recorded {len(audio) / self.sample_rate:.1f}s of audio.")
+        duration = len(audio) / self.sample_rate
+        audio_rms = np.sqrt(np.mean(audio.astype(np.float32) ** 2))
+        logger.info(
+            f"Recorded {duration:.1f}s of audio "
+            f"(RMS={audio_rms:.0f}, peak={np.max(np.abs(audio)):.0f})"
+        )
         return audio
 
     # ---- Continuous listening mode ----
 
     def start_continuous(self, on_speech: Callable[[np.ndarray], None]):
-        """Start continuous listening mode.
-
-        The on_speech callback is called with the audio data whenever
-        speech is detected and followed by silence.
-        """
+        """Start continuous listening mode."""
         if self._continuous:
             logger.warning("Continuous listening already active.")
             return
+
+        # Auto-calibrate on first use
+        if not self._calibrated:
+            self.calibrate()
 
         self._on_speech_callback = on_speech
         self._continuous = True
@@ -141,7 +220,10 @@ class AudioRecorder:
             target=self._continuous_loop, daemon=True, name="continuous-listener"
         )
         self._continuous_thread.start()
-        logger.info("Continuous listening started.")
+        logger.info(
+            f"Continuous listening started "
+            f"(speech_threshold={self._speech_threshold:.0f})"
+        )
 
     def stop_continuous(self):
         """Stop continuous listening mode."""
@@ -178,7 +260,7 @@ class AudioRecorder:
                 blocksize=self.chunk_size,
                 callback=callback,
             ):
-                logger.info("Continuous listener: microphone open.")
+                logger.info("Continuous listener: microphone open, waiting for speech...")
                 while self._continuous:
                     self._wait_for_speech(
                         audio_q, chunks_per_second,
@@ -191,7 +273,7 @@ class AudioRecorder:
         except Exception as e:
             logger.error(f"Continuous listener error: {e}", exc_info=True)
         finally:
-            logger.info("Continuous listener stopped.")
+            logger.info("Continuous listener exited.")
 
     def _wait_for_speech(self, audio_q, chunks_per_second,
                          silence_threshold_chunks, min_speech_chunks,
@@ -202,8 +284,10 @@ class AudioRecorder:
         speech_count = 0
         recording = False
 
+        # Use calibrated speech threshold for continuous detection
+        speech_threshold = self._speech_threshold
+
         # Pre-buffer: keep the last N chunks of audio before speech starts
-        # This prevents cutting off the beginning of words
         pre_buffer = collections.deque(maxlen=pre_buffer_size)
 
         while self._continuous:
@@ -223,21 +307,21 @@ class AudioRecorder:
                 # Waiting for speech to start — keep pre-buffer rolling
                 pre_buffer.append(chunk)
 
-                if rms >= self.silence_threshold:
+                if rms >= speech_threshold:
                     recording = True
                     # Include pre-buffer audio so word beginnings aren't cut off
                     chunks = list(pre_buffer)
                     speech_count = 1
                     silence_count = 0
                     logger.debug(
-                        f"Continuous: speech started "
-                        f"(pre-buffer: {len(chunks)} chunks)"
+                        f"Speech detected (RMS={rms:.0f} >= {speech_threshold:.0f}), "
+                        f"pre-buffer: {len(chunks)} chunks"
                     )
             else:
-                # Currently recording
+                # Currently recording speech
                 chunks.append(chunk)
 
-                if rms >= self.silence_threshold:
+                if rms >= speech_threshold:
                     silence_count = 0
                     speech_count += 1
                 else:
@@ -248,9 +332,10 @@ class AudioRecorder:
                     if speech_count >= min_speech_chunks:
                         audio = np.concatenate(chunks, axis=0).flatten()
                         duration = len(audio) / self.sample_rate
+                        audio_rms = np.sqrt(np.mean(audio.astype(np.float32) ** 2))
                         logger.info(
-                            f"Continuous: speech ended ({duration:.1f}s, "
-                            f"{speech_count} speech chunks)"
+                            f"Speech ended ({duration:.1f}s, {speech_count} chunks, "
+                            f"RMS={audio_rms:.0f})"
                         )
                         if self._on_speech_callback:
                             try:
@@ -258,14 +343,15 @@ class AudioRecorder:
                             except Exception as e:
                                 logger.error(f"Speech callback error: {e}")
                     else:
-                        logger.debug("Continuous: too short, ignoring noise")
+                        logger.debug(
+                            f"Too short ({speech_count} chunks), ignoring"
+                        )
                     return
 
                 if len(chunks) >= max_chunks:
                     audio = np.concatenate(chunks, axis=0).flatten()
                     logger.info(
-                        f"Continuous: max duration reached "
-                        f"({self.max_record_seconds}s)"
+                        f"Max recording duration reached ({self.max_record_seconds}s)"
                     )
                     if self._on_speech_callback and speech_count >= min_speech_chunks:
                         try:
