@@ -35,10 +35,10 @@ class AudioConfig:
 
 @dataclass
 class HotkeyConfig:
-    push_to_talk: str = "ctrl+shift+space"
+    push_to_talk: str = "ctrl+q"
     toggle_active: str = "ctrl+shift+a"
     toggle_language: str = "ctrl+shift+l"
-    quit: str = "ctrl+shift+q"
+    quit: str = "ctrl+shift+x"
 
 
 @dataclass

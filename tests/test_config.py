@@ -43,9 +43,9 @@ class TestAudioConfig:
 class TestHotkeyConfig:
     def test_defaults(self):
         cfg = HotkeyConfig()
-        assert cfg.push_to_talk == "ctrl+shift+space"
+        assert cfg.push_to_talk == "ctrl+q"
         assert cfg.toggle_language == "ctrl+shift+l"
-        assert cfg.quit == "ctrl+shift+q"
+        assert cfg.quit == "ctrl+shift+x"
 
 
 class TestAppConfig:

@@ -31,6 +31,7 @@ dependencies = [
     "ukrainian-tts @ git+https://github.com/robinhad/ukrainian-tts.git",
 
     # UI
+    "customtkinter>=5.2.0",
     "pystray>=0.19.0",
     "Pillow>=10.0.0",
     "keyboard>=0.13.5",
@@ -52,6 +53,7 @@ dev = [
 
 [project.scripts]
 kabolai = "kabolai.cli.main:main"
+kabolai-gui = "kabolai.gui.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

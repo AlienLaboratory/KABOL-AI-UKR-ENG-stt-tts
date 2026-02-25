@@ -1,9 +1,15 @@
 """Constants for KA-BOL-AI."""
 
+import sys
 from pathlib import Path
 
-# Project root (two levels up from this file: core/ -> kabolai/ -> src/ -> project root)
-PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
+# Project root — handles both normal and PyInstaller frozen mode
+if getattr(sys, 'frozen', False):
+    # Running as PyInstaller bundle: exe is in dist/KA-BOL-AI/
+    PROJECT_ROOT = Path(sys.executable).parent
+else:
+    # Normal Python: core/ -> kabolai/ -> src/ -> project root
+    PROJECT_ROOT = Path(__file__).parent.parent.parent.parent
 
 # Default paths
 CONFIG_DIR = PROJECT_ROOT / "config"
@@ -14,7 +20,7 @@ LOGS_DIR = PROJECT_ROOT / "logs"
 SUPPORTED_LANGUAGES = ("en", "uk")
 DEFAULT_LANGUAGE = "en"
 
-# VOSK model download URLs
+# VOSK model download info (flat lookup by key)
 VOSK_MODELS = {
     "en_small": {
         "url": "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip",
@@ -35,6 +41,23 @@ VOSK_MODELS = {
         "url": "https://alphacephei.com/vosk/models/vosk-model-uk-v3-small.zip",
         "dir_name": "vosk-model-uk-v3-small",
         "size_mb": 133,
+    },
+}
+
+# VOSK model URLs mapped by profile -> language
+# This is what the GUI wizard uses to know what to download
+VOSK_MODEL_URLS = {
+    "cpu": {
+        "en": VOSK_MODELS["en_small"],
+        "uk": VOSK_MODELS["uk_small"],
+    },
+    "gpu_light": {
+        "en": VOSK_MODELS["en_large"],
+        "uk": VOSK_MODELS["uk_large"],
+    },
+    "gpu_full": {
+        "en": VOSK_MODELS["en_large"],
+        "uk": VOSK_MODELS["uk_large"],
     },
 }
 

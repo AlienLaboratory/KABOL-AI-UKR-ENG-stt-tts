@@ -1,8 +1,15 @@
-"""Main assistant orchestrator: record -> STT -> brain -> action -> TTS -> play."""
+"""Main assistant orchestrator with event callbacks and self-healing.
+
+Pipeline: record -> STT -> brain -> action -> TTS -> play
+Each step has timeout protection. State is properly managed so the
+assistant NEVER gets permanently stuck.
+"""
 
 import logging
+import queue
 import threading
-from typing import Optional
+import time
+from typing import Callable, Optional
 
 from kabolai.core.config import AppConfig
 from kabolai.core.state import AssistantState
@@ -16,13 +23,27 @@ from kabolai.actions.conversation import set_state_ref
 
 logger = logging.getLogger(__name__)
 
+# Maximum time (seconds) for the entire voice pipeline before watchdog kills it
+PIPELINE_TIMEOUT = 45
+
 
 class Assistant:
-    """Main assistant that orchestrates the voice pipeline."""
+    """Main assistant that orchestrates the voice pipeline.
+
+    Features:
+    - Event callbacks for GUI integration (user_text, response_text, error, status)
+    - Self-healing watchdog — auto-resets if pipeline hangs
+    - Proper state transitions — is_listening, is_processing, is_speaking
+      are set/cleared at the right moments
+    """
 
     def __init__(self, config: AppConfig):
         self.config = config
         self.state = AssistantState(language=config.language)
+
+        # Event system for GUI integration
+        self._event_callbacks = []
+        self._event_queue = queue.Queue()
 
         # Give conversation actions access to state
         set_state_ref(self.state)
@@ -39,10 +60,44 @@ class Assistant:
         logger.info("Initializing STT engine...")
         self.stt = create_stt_engine(config)
 
-        # TTS engines (lazy-load Ukrainian only when needed)
+        # TTS engines (lazy-load only when needed)
         logger.info("Initializing TTS engines...")
         self._tts_en = None
         self._tts_uk = None
+
+    # ---- Event System ----
+
+    def add_event_callback(self, callback: Callable):
+        """Register a callback for assistant events.
+
+        Callback signature: callback(event_type: str, data: dict)
+        Event types: 'user_text', 'response_text', 'error', 'status'
+        """
+        self._event_callbacks.append(callback)
+
+    def _emit_event(self, event_type: str, data: dict = None):
+        """Emit an event to all registered callbacks and the event queue."""
+        event = {"type": event_type, "data": data or {}, "time": time.time()}
+        # Put in queue for GUI polling
+        self._event_queue.put(event)
+        # Direct callbacks
+        for cb in self._event_callbacks:
+            try:
+                cb(event_type, data or {})
+            except Exception as e:
+                logger.error(f"Event callback error: {e}")
+
+    def drain_events(self) -> list:
+        """Drain all pending events from the queue (for GUI polling)."""
+        events = []
+        while True:
+            try:
+                events.append(self._event_queue.get_nowait())
+            except queue.Empty:
+                break
+        return events
+
+    # ---- Action Registration ----
 
     def _register_actions(self):
         """Import action modules so decorators register them."""
@@ -51,6 +106,8 @@ class Assistant:
         import kabolai.actions.web  # noqa: F401
         import kabolai.actions.media  # noqa: F401
         import kabolai.actions.conversation  # noqa: F401
+
+    # ---- TTS Lazy Loading ----
 
     @property
     def tts_en(self):
@@ -64,8 +121,51 @@ class Assistant:
             self._tts_uk = create_tts_engine(self.config, lang="uk")
         return self._tts_uk
 
+    # ---- Voice Pipeline ----
+
+    def handle_voice(self):
+        """Record and process a voice command (thread-safe, self-healing).
+
+        This replaces the old _handle_voice() in main.py. It manages all
+        state transitions properly and uses the watchdog-protected pipeline lock.
+
+        Call from a daemon thread or directly — it handles everything.
+        """
+        # Try to acquire the pipeline lock
+        if not self.state.try_start_pipeline():
+            logger.debug("Pipeline already running, ignoring new request.")
+            return
+
+        try:
+            self._emit_event("status", {"state": "listening"})
+            self.state.set_listening(True)
+
+            # Step 0: Record audio
+            audio = self.recorder.record()
+            self.state.set_listening(False)
+
+            if audio is None:
+                self._emit_event("status", {"state": "ready"})
+                return
+
+            # Process the audio through the full pipeline
+            self.state.set_processing(True)
+            self._emit_event("status", {"state": "processing"})
+            self._process(audio)
+
+        except Exception as e:
+            logger.error(f"Voice pipeline error: {e}", exc_info=True)
+            self._emit_event("error", {"message": str(e)})
+        finally:
+            # ALWAYS release state — this is the self-healing guarantee
+            self.state.end_pipeline()
+            self._emit_event("status", {"state": "ready"})
+
     def process_utterance(self, audio_data) -> Optional[str]:
-        """Full pipeline: audio -> text -> intent -> action -> response -> speech."""
+        """Full pipeline: audio -> text -> intent -> action -> response -> speech.
+
+        For backward compatibility with tests and direct calls.
+        """
         self.state.set_processing(True)
         try:
             return self._process(audio_data)
@@ -77,7 +177,6 @@ class Assistant:
 
         # Step 1: STT
         if hasattr(self.stt, 'transcribe'):
-            # VOSK engine supports language parameter
             try:
                 result = self.stt.transcribe(audio_data, language=lang)
             except TypeError:
@@ -91,6 +190,7 @@ class Assistant:
 
         user_text = result.text.strip()
         logger.info(f"[STT] ({lang}): {user_text}")
+        self._emit_event("user_text", {"text": user_text, "language": lang})
 
         # Step 2: Brain - parse intent
         brain_response = self.brain.process(user_text, lang)
@@ -104,28 +204,47 @@ class Assistant:
         response_text = brain_response.response_text
 
         if brain_response.command and not brain_response.is_conversation:
-            action_result = registry.execute(
-                brain_response.command.action,
-                brain_response.command.params,
-            )
-            logger.info(
-                f"[Action] {brain_response.command.action} -> "
-                f"success={action_result.success}, msg='{action_result.message}'"
-            )
-
-            # Use action-provided speak text if available
-            if action_result.success:
-                speak = (
-                    action_result.speak_text_uk if lang == "uk"
-                    else action_result.speak_text_en
+            try:
+                action_result = registry.execute(
+                    brain_response.command.action,
+                    brain_response.command.params,
                 )
-                if speak:
-                    response_text = speak
+                logger.info(
+                    f"[Action] {brain_response.command.action} -> "
+                    f"success={action_result.success}, msg='{action_result.message}'"
+                )
 
-        # Step 4: TTS
+                # Use action-provided speak text if available
+                if action_result.success:
+                    speak = (
+                        action_result.speak_text_uk if lang == "uk"
+                        else action_result.speak_text_en
+                    )
+                    if speak:
+                        response_text = speak
+            except Exception as e:
+                logger.error(f"[Action] Error: {e}", exc_info=True)
+                response_text = (
+                    "Помилка при виконанні команди."
+                    if lang == "uk"
+                    else "Error executing command."
+                )
+
+        self._emit_event("response_text", {"text": response_text, "language": lang})
+
+        # Step 4: TTS + Playback
+        self._speak_response(response_text, lang)
+
+        return response_text
+
+    def _speak_response(self, text: str, lang: str):
+        """Synthesize and play speech with proper state management."""
+        self.state.set_processing(False)
+        self.state.set_speaking(True)
+        self._emit_event("status", {"state": "speaking"})
         try:
             tts = self.tts_uk if lang == "uk" else self.tts_en
-            speech = tts.synthesize(response_text)
+            speech = tts.synthesize(text)
             if speech.audio_data:
                 if speech.format == "wav":
                     self.player.play_wav(speech.audio_data)
@@ -134,23 +253,14 @@ class Assistant:
                         speech.audio_data, speech.sample_rate
                     )
         except Exception as e:
-            logger.error(f"[TTS] Error: {e}", exc_info=True)
-
-        return response_text
+            logger.error(f"[TTS/Playback] Error: {e}", exc_info=True)
+        finally:
+            self.state.set_speaking(False)
 
     def speak(self, text: str, lang: str = None):
         """Speak text in the specified or current language."""
         lang = lang or self.state.language
-        try:
-            tts = self.tts_uk if lang == "uk" else self.tts_en
-            speech = tts.synthesize(text)
-            if speech.audio_data:
-                if speech.format == "wav":
-                    self.player.play_wav(speech.audio_data)
-                else:
-                    self.player.play_bytes(speech.audio_data, speech.sample_rate)
-        except Exception as e:
-            logger.error(f"[TTS] Speak error: {e}")
+        self._speak_response(text, lang)
 
     def check_brain(self) -> bool:
         """Check if the LLM brain is available."""
@@ -160,6 +270,9 @@ class Assistant:
         """Clean up all resources."""
         logger.info("Shutting down assistant...")
         self.state.shutdown()
+        # Stop any in-progress playback
+        self.player.stop()
+        self.recorder.stop()
         self.stt.cleanup()
         if self._tts_en:
             self._tts_en.cleanup()

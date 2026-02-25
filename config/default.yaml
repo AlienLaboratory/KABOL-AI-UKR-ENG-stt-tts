@@ -18,10 +18,10 @@ audio:
 
 # Hotkey bindings
 hotkeys:
-  push_to_talk: "ctrl+shift+space"
+  push_to_talk: "ctrl+q"
   toggle_active: "ctrl+shift+a"
   toggle_language: "ctrl+shift+l"
-  quit: "ctrl+shift+q"
+  quit: "ctrl+shift+x"
 
 # Speech-to-Text
 stt:

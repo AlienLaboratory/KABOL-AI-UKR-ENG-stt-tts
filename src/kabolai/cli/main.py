@@ -91,14 +91,15 @@ def run(profile, language, config, no_tray):
         )
         tray.run_in_background()
 
-    # Bind hotkeys
+    # Bind hotkeys — using the new self-healing handle_voice()
     def on_push_to_talk():
         if not assistant.state.is_active:
             return
-        if assistant.state.is_listening or assistant.state.is_processing:
-            return
+        # handle_voice() has its own pipeline lock — no need to check
+        # is_listening/is_processing here. If already busy, it returns
+        # immediately. If stuck, the watchdog auto-resets.
         threading.Thread(
-            target=_handle_voice, args=(assistant,), daemon=True
+            target=assistant.handle_voice, daemon=True
         ).start()
 
     hotkey_mgr.bind(
@@ -125,23 +126,13 @@ def run(profile, language, config, no_tray):
         _quit(assistant, hotkey_mgr, tray)
 
 
-def _handle_voice(assistant):
-    """Record and process a voice command."""
-    assistant.state.set_listening(True)
-    try:
-        audio = assistant.recorder.record()
-        if audio is not None:
-            assistant.process_utterance(audio)
-    except Exception as e:
-        logger.error(f"Voice processing error: {e}", exc_info=True)
-    finally:
-        assistant.state.set_listening(False)
-
-
 def _toggle_active(assistant, tray=None):
     new_state = assistant.state.toggle_active()
     status = "ACTIVE" if new_state else "INACTIVE"
     click.echo(f"[{status}]")
+    if new_state:
+        # Force-reset pipeline state when reactivating
+        assistant.state.force_reset()
     if tray:
         tray.update_icon()
 
@@ -159,6 +150,19 @@ def _quit(assistant, hotkey_mgr, tray=None):
     if tray:
         tray.stop()
     assistant.shutdown()
+
+
+@main.command()
+@click.option("--profile", "-p", default=None,
+              type=click.Choice(["cpu", "gpu_light", "gpu_full"]),
+              help="Hardware profile")
+@click.option("--language", "-l", default=None,
+              type=click.Choice(["en", "uk"]),
+              help="Starting language")
+def gui(profile, language):
+    """Launch the GUI application."""
+    from kabolai.gui.app import main as gui_main
+    gui_main(profile=profile, language=language)
 
 
 @main.command()
