@@ -1,7 +1,7 @@
 """faster-whisper based speech-to-text engine (GPU accelerated).
 
-Whisper Medium on RTX 4070: ~1.5GB VRAM, ~3-4% WER, supports 99 languages.
-Uses VAD filter to skip silence and improve accuracy.
+Whisper large-v3 on RTX 4070: ~3GB VRAM, ~2-3% WER, supports 99 languages.
+Uses VAD filter + initial_prompt to improve command recognition accuracy.
 """
 
 import logging
@@ -91,11 +91,26 @@ class WhisperSTT(STTEngine):
         # Map language codes
         whisper_lang = {"en": "en", "uk": "uk"}.get(language)
 
+        # Initial prompt biases Whisper toward common voice commands
+        # This dramatically improves accuracy for short utterances
+        if whisper_lang == "uk":
+            initial_prompt = (
+                "відкрий ютуб, відкрий гугл, грай музику, яка погода, "
+                "котра година, гучність, відкрий браузер, пошук"
+            )
+        else:
+            initial_prompt = (
+                "open YouTube, open Google, play music, what time is it, "
+                "search for, volume up, volume down, open browser, "
+                "what's the weather, open Chrome, play a song"
+            )
+
         try:
             segments, info = self._model.transcribe(
                 audio_float,
                 language=whisper_lang,
                 beam_size=5,
+                initial_prompt=initial_prompt,
                 vad_filter=True,
                 vad_parameters=dict(
                     min_silence_duration_ms=300,

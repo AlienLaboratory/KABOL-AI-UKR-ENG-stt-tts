@@ -3,8 +3,12 @@
 Supports two modes:
 - Push-to-talk: record() — records when called, stops on silence
 - Continuous: start_continuous() — always listens, calls callback when speech detected
+
+Key feature: Pre-buffer keeps ~0.5s of audio BEFORE speech starts, so the
+beginning of words isn't cut off (prevents "youtube" → "your top").
 """
 
+import collections
 import logging
 import queue
 import threading
@@ -20,8 +24,11 @@ from kabolai.core.exceptions import AudioError
 logger = logging.getLogger(__name__)
 
 # Minimum speech duration (seconds) before we consider it real speech
-# Prevents random noises from triggering the pipeline
 MIN_SPEECH_DURATION = 0.3
+
+# Pre-buffer: keep this many seconds of audio before speech starts
+# This prevents cutting off the beginning of words
+PRE_BUFFER_DURATION = 0.5
 
 # Cooldown after processing (seconds) to avoid hearing the TTS response
 POST_SPEECH_COOLDOWN = 1.0
@@ -61,11 +68,7 @@ class AudioRecorder:
     # ---- Push-to-talk mode ----
 
     def record(self) -> Optional[np.ndarray]:
-        """Record audio until silence is detected or max duration reached.
-
-        Returns:
-            numpy array of int16 audio samples, or None if no speech detected.
-        """
+        """Record audio until silence is detected or max duration reached."""
         self._is_recording = True
         self._audio_queue = queue.Queue()
         chunks = []
@@ -95,7 +98,6 @@ class AudioRecorder:
                     chunks.append(chunk)
                     chunk_count += 1
 
-                    # Check RMS for silence detection
                     rms = np.sqrt(np.mean(chunk.astype(np.float32) ** 2))
 
                     if rms < self.silence_threshold:
@@ -104,7 +106,6 @@ class AudioRecorder:
                         silence_chunks = 0
                         has_speech = True
 
-                    # Stop if enough silence after speech
                     if has_speech and silence_chunks >= silence_chunks_threshold:
                         logger.info("Silence detected, stopping recording.")
                         break
@@ -128,11 +129,7 @@ class AudioRecorder:
         """Start continuous listening mode.
 
         The on_speech callback is called with the audio data whenever
-        speech is detected and followed by silence (same logic as record()).
-        This runs in a background thread.
-
-        Args:
-            on_speech: callback(audio_data: np.ndarray) — called when speech ends
+        speech is detected and followed by silence.
         """
         if self._continuous:
             logger.warning("Continuous listening already active.")
@@ -155,11 +152,7 @@ class AudioRecorder:
         logger.info("Continuous listening stopped.")
 
     def set_cooldown(self, seconds: float = POST_SPEECH_COOLDOWN):
-        """Set a cooldown period (e.g., after TTS playback finishes).
-
-        During cooldown, the continuous listener ignores audio to prevent
-        it from hearing the assistant's own TTS output.
-        """
+        """Set a cooldown period to prevent hearing own TTS output."""
         self._cooldown_until = time.monotonic() + seconds
 
     def _continuous_loop(self):
@@ -175,6 +168,7 @@ class AudioRecorder:
         silence_threshold_chunks = int(self.silence_duration * chunks_per_second)
         min_speech_chunks = int(MIN_SPEECH_DURATION * chunks_per_second)
         max_chunks = int(self.max_record_seconds * chunks_per_second)
+        pre_buffer_size = max(1, int(PRE_BUFFER_DURATION * chunks_per_second))
 
         try:
             with sd.InputStream(
@@ -189,7 +183,7 @@ class AudioRecorder:
                     self._wait_for_speech(
                         audio_q, chunks_per_second,
                         silence_threshold_chunks, min_speech_chunks,
-                        max_chunks,
+                        max_chunks, pre_buffer_size,
                     )
 
         except sd.PortAudioError as e:
@@ -201,12 +195,16 @@ class AudioRecorder:
 
     def _wait_for_speech(self, audio_q, chunks_per_second,
                          silence_threshold_chunks, min_speech_chunks,
-                         max_chunks):
-        """Wait for speech, record it, then trigger callback."""
+                         max_chunks, pre_buffer_size):
+        """Wait for speech, record it (with pre-buffer), then trigger callback."""
         chunks = []
         silence_count = 0
         speech_count = 0
         recording = False
+
+        # Pre-buffer: keep the last N chunks of audio before speech starts
+        # This prevents cutting off the beginning of words
+        pre_buffer = collections.deque(maxlen=pre_buffer_size)
 
         while self._continuous:
             try:
@@ -216,18 +214,25 @@ class AudioRecorder:
 
             # Check cooldown (ignore audio right after TTS playback)
             if time.monotonic() < self._cooldown_until:
+                pre_buffer.clear()
                 continue
 
             rms = np.sqrt(np.mean(chunk.astype(np.float32) ** 2))
 
             if not recording:
-                # Waiting for speech to start
+                # Waiting for speech to start — keep pre-buffer rolling
+                pre_buffer.append(chunk)
+
                 if rms >= self.silence_threshold:
                     recording = True
-                    chunks = [chunk]
+                    # Include pre-buffer audio so word beginnings aren't cut off
+                    chunks = list(pre_buffer)
                     speech_count = 1
                     silence_count = 0
-                    logger.debug("Continuous: speech started")
+                    logger.debug(
+                        f"Continuous: speech started "
+                        f"(pre-buffer: {len(chunks)} chunks)"
+                    )
             else:
                 # Currently recording
                 chunks.append(chunk)
@@ -240,9 +245,7 @@ class AudioRecorder:
 
                 # Stop conditions
                 if silence_count >= silence_threshold_chunks:
-                    # Enough silence after speech
                     if speech_count >= min_speech_chunks:
-                        # Real speech detected — trigger callback
                         audio = np.concatenate(chunks, axis=0).flatten()
                         duration = len(audio) / self.sample_rate
                         logger.info(
@@ -256,13 +259,14 @@ class AudioRecorder:
                                 logger.error(f"Speech callback error: {e}")
                     else:
                         logger.debug("Continuous: too short, ignoring noise")
-                    # Reset
                     return
 
                 if len(chunks) >= max_chunks:
-                    # Max duration reached
                     audio = np.concatenate(chunks, axis=0).flatten()
-                    logger.info(f"Continuous: max duration reached ({self.max_record_seconds}s)")
+                    logger.info(
+                        f"Continuous: max duration reached "
+                        f"({self.max_record_seconds}s)"
+                    )
                     if self._on_speech_callback and speech_count >= min_speech_chunks:
                         try:
                             self._on_speech_callback(audio)

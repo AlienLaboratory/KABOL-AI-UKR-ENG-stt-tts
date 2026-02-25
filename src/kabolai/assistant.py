@@ -1,8 +1,8 @@
-"""Main assistant orchestrator with event callbacks and self-healing.
+"""Main assistant orchestrator with interrupt support and self-healing.
 
 Pipeline: record -> STT -> brain -> action -> TTS -> play
-Each step has timeout protection. State is properly managed so the
-assistant NEVER gets permanently stuck.
+Key feature: user can INTERRUPT at any time by speaking again.
+When interrupted, current pipeline is cancelled and new speech is processed.
 """
 
 import logging
@@ -24,17 +24,17 @@ from kabolai.actions.conversation import set_state_ref
 logger = logging.getLogger(__name__)
 
 # Maximum time (seconds) for the entire voice pipeline before watchdog kills it
-PIPELINE_TIMEOUT = 45
+PIPELINE_TIMEOUT = 20
 
 
 class Assistant:
     """Main assistant that orchestrates the voice pipeline.
 
     Features:
+    - INTERRUPT: user can talk at any time to cancel current pipeline
     - Event callbacks for GUI integration (user_text, response_text, error, status)
     - Self-healing watchdog — auto-resets if pipeline hangs
-    - Proper state transitions — is_listening, is_processing, is_speaking
-      are set/cleared at the right moments
+    - Proper state transitions
     """
 
     def __init__(self, config: AppConfig):
@@ -47,6 +47,11 @@ class Assistant:
 
         # TTS mute state (skip speech playback when True)
         self.tts_muted = False
+
+        # Interrupt/cancel support
+        self._cancel = threading.Event()
+        self._pending_audio = None
+        self._pending_lock = threading.Lock()
 
         # Give conversation actions access to state
         set_state_ref(self.state)
@@ -71,19 +76,13 @@ class Assistant:
     # ---- Event System ----
 
     def add_event_callback(self, callback: Callable):
-        """Register a callback for assistant events.
-
-        Callback signature: callback(event_type: str, data: dict)
-        Event types: 'user_text', 'response_text', 'error', 'status'
-        """
+        """Register a callback for assistant events."""
         self._event_callbacks.append(callback)
 
     def _emit_event(self, event_type: str, data: dict = None):
         """Emit an event to all registered callbacks and the event queue."""
         event = {"type": event_type, "data": data or {}, "time": time.time()}
-        # Put in queue for GUI polling
         self._event_queue.put(event)
-        # Direct callbacks
         for cb in self._event_callbacks:
             try:
                 cb(event_type, data or {})
@@ -127,23 +126,16 @@ class Assistant:
     # ---- Voice Pipeline ----
 
     def handle_voice(self):
-        """Record and process a voice command (thread-safe, self-healing).
-
-        This replaces the old _handle_voice() in main.py. It manages all
-        state transitions properly and uses the watchdog-protected pipeline lock.
-
-        Call from a daemon thread or directly — it handles everything.
-        """
-        # Try to acquire the pipeline lock
+        """Record and process a voice command (push-to-talk mode)."""
         if not self.state.try_start_pipeline():
             logger.debug("Pipeline already running, ignoring new request.")
             return
 
+        self._cancel.clear()
         try:
             self._emit_event("status", {"state": "listening"})
             self.state.set_listening(True)
 
-            # Step 0: Record audio
             audio = self.recorder.record()
             self.state.set_listening(False)
 
@@ -151,7 +143,6 @@ class Assistant:
                 self._emit_event("status", {"state": "ready"})
                 return
 
-            # Process the audio through the full pipeline
             self.state.set_processing(True)
             self._emit_event("status", {"state": "processing"})
             self._process(audio)
@@ -160,23 +151,17 @@ class Assistant:
             logger.error(f"Voice pipeline error: {e}", exc_info=True)
             self._emit_event("error", {"message": str(e)})
         finally:
-            # ALWAYS release state — this is the self-healing guarantee
             self.state.end_pipeline()
             self._emit_event("status", {"state": "ready"})
 
-    def process_utterance(self, audio_data) -> Optional[str]:
-        """Full pipeline: audio -> text -> intent -> action -> response -> speech.
-
-        For backward compatibility with tests and direct calls.
-        """
-        self.state.set_processing(True)
-        try:
-            return self._process(audio_data)
-        finally:
-            self.state.set_processing(False)
-
     def _process(self, audio_data) -> Optional[str]:
+        """Full pipeline: audio -> STT -> brain -> action -> TTS."""
         lang = self.state.language
+
+        # Check cancel before STT
+        if self._cancel.is_set():
+            logger.info("[Pipeline] Cancelled before STT.")
+            return None
 
         # Step 1: STT
         if hasattr(self.stt, 'transcribe'):
@@ -195,6 +180,11 @@ class Assistant:
         logger.info(f"[STT] ({lang}): {user_text}")
         self._emit_event("user_text", {"text": user_text, "language": lang})
 
+        # Check cancel before brain
+        if self._cancel.is_set():
+            logger.info("[Pipeline] Cancelled before brain.")
+            return None
+
         # Step 2: Brain - parse intent
         brain_response = self.brain.process(user_text, lang)
         logger.info(
@@ -202,6 +192,11 @@ class Assistant:
             f"conv={brain_response.is_conversation}, "
             f"resp='{brain_response.response_text[:80]}'"
         )
+
+        # Check cancel before action
+        if self._cancel.is_set():
+            logger.info("[Pipeline] Cancelled before action.")
+            return None
 
         # Step 3: Execute action (if any)
         response_text = brain_response.response_text
@@ -217,7 +212,6 @@ class Assistant:
                     f"success={action_result.success}, msg='{action_result.message}'"
                 )
 
-                # Use action-provided speak text if available
                 if action_result.success:
                     speak = (
                         action_result.speak_text_uk if lang == "uk"
@@ -235,6 +229,11 @@ class Assistant:
 
         self._emit_event("response_text", {"text": response_text, "language": lang})
 
+        # Check cancel before TTS
+        if self._cancel.is_set():
+            logger.info("[Pipeline] Cancelled before TTS.")
+            return response_text
+
         # Step 4: TTS + Playback
         self._speak_response(response_text, lang)
 
@@ -244,9 +243,12 @@ class Assistant:
         """Synthesize and play speech with proper state management."""
         self.state.set_processing(False)
 
-        # Skip TTS entirely when muted
+        # Skip TTS when muted or cancelled
         if self.tts_muted:
             logger.info("[TTS] Muted — skipping speech playback.")
+            return
+        if self._cancel.is_set():
+            logger.info("[TTS] Cancelled — skipping speech.")
             return
 
         self.state.set_speaking(True)
@@ -255,7 +257,6 @@ class Assistant:
         # Set cooldown BEFORE playback so continuous listener
         # ignores audio during TTS (prevents hearing own response)
         if self.is_continuous:
-            # Estimate speech duration: ~150 words/min ≈ 2.5 words/sec
             word_count = len(text.split())
             estimated_duration = max(2.0, word_count / 2.5)
             self.recorder.set_cooldown(estimated_duration + 1.0)
@@ -263,6 +264,12 @@ class Assistant:
         try:
             tts = self.tts_uk if lang == "uk" else self.tts_en
             speech = tts.synthesize(text)
+
+            # Check cancel after synthesis (before playback)
+            if self._cancel.is_set():
+                logger.info("[TTS] Cancelled after synthesis, skipping playback.")
+                return
+
             if speech.audio_data:
                 if speech.format == "wav":
                     self.player.play_wav(speech.audio_data)
@@ -274,7 +281,6 @@ class Assistant:
             logger.error(f"[TTS/Playback] Error: {e}", exc_info=True)
         finally:
             self.state.set_speaking(False)
-            # Extra safety cooldown after playback finishes
             if self.is_continuous:
                 self.recorder.set_cooldown(1.0)
 
@@ -283,29 +289,49 @@ class Assistant:
         lang = lang or self.state.language
         self._speak_response(text, lang)
 
+    # ---- Interrupt Support ----
+
+    def interrupt(self):
+        """Cancel the current pipeline immediately.
+
+        Called when the user speaks while a pipeline is running.
+        The cancel flag is checked at multiple points in _process().
+        """
+        self._cancel.set()
+        # Stop any ongoing audio playback immediately
+        try:
+            self.player.stop()
+        except Exception:
+            pass
+        logger.info("[Interrupt] Pipeline cancel signal sent + audio stopped.")
+
     # ---- Continuous Listening Mode ----
 
     def start_continuous(self):
         """Start always-listening mode (like Gemini/ChatGPT voice).
 
         The microphone stays open and automatically detects when you speak.
-        When speech ends (silence detected), it runs the full pipeline
-        in a SEPARATE THREAD so the listener keeps listening immediately.
-        After TTS playback, a cooldown prevents hearing its own response.
+        When speech ends, it runs the full pipeline in a SEPARATE THREAD.
+        If user speaks while pipeline is busy, it INTERRUPTS the current
+        pipeline and processes the new speech instead.
         """
         logger.info("Starting continuous listening mode.")
         self._emit_event("status", {"state": "ready"})
 
         def on_speech_detected(audio_data):
-            """Called by continuous listener — MUST return fast.
-
-            Spawns a new thread for processing so the listener
-            goes back to detecting speech immediately.
-            """
+            """Called by continuous listener — MUST return fast."""
             if not self.state.is_active:
                 return
 
-            # Non-blocking: spawn a thread and return immediately
+            # If pipeline is busy, INTERRUPT it and queue new audio
+            if self.state.is_busy:
+                logger.info("[Continuous] User spoke — interrupting current pipeline!")
+                self.interrupt()
+                with self._pending_lock:
+                    self._pending_audio = audio_data
+                return
+
+            # Pipeline free — process in a separate thread
             threading.Thread(
                 target=self._process_continuous_speech,
                 args=(audio_data,),
@@ -317,9 +343,13 @@ class Assistant:
     def _process_continuous_speech(self, audio_data):
         """Process speech from continuous listener in a separate thread."""
         if not self.state.try_start_pipeline():
-            logger.debug("Pipeline busy, skipping.")
+            # Pipeline was claimed between our check and now — queue it
+            with self._pending_lock:
+                self._pending_audio = audio_data
+            logger.debug("Pipeline lock contention — queued audio.")
             return
 
+        self._cancel.clear()
         try:
             self.state.set_processing(True)
             self._emit_event("status", {"state": "processing"})
@@ -330,6 +360,17 @@ class Assistant:
         finally:
             self.state.end_pipeline()
             self._emit_event("status", {"state": "ready"})
+
+        # After current pipeline finishes, process any pending audio
+        # from interrupt
+        pending = None
+        with self._pending_lock:
+            pending = self._pending_audio
+            self._pending_audio = None
+
+        if pending is not None:
+            logger.info("[Continuous] Processing queued interrupt audio.")
+            self._process_continuous_speech(pending)
 
     def stop_continuous(self):
         """Stop always-listening mode."""
@@ -348,8 +389,8 @@ class Assistant:
     def shutdown(self):
         """Clean up all resources."""
         logger.info("Shutting down assistant...")
+        self._cancel.set()
         self.state.shutdown()
-        # Stop continuous listener and playback
         self.recorder.stop_continuous()
         self.player.stop()
         self.recorder.stop()

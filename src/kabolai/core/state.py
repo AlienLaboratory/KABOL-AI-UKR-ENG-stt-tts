@@ -7,7 +7,7 @@ import time
 logger = logging.getLogger(__name__)
 
 # Maximum seconds any single pipeline run can take before auto-reset
-PIPELINE_TIMEOUT = 60
+PIPELINE_TIMEOUT = 20
 
 
 class AssistantState:
