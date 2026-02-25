@@ -36,7 +36,7 @@ class TestAudioConfig:
         cfg = AudioConfig()
         assert cfg.sample_rate == 16000
         assert cfg.channels == 1
-        assert cfg.silence_duration == 1.5
+        assert cfg.silence_duration == 0.8
         assert cfg.max_record_seconds == 30
 
 

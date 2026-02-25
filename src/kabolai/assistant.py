@@ -45,6 +45,9 @@ class Assistant:
         self._event_callbacks = []
         self._event_queue = queue.Queue()
 
+        # TTS mute state (skip speech playback when True)
+        self.tts_muted = False
+
         # Give conversation actions access to state
         set_state_ref(self.state)
 
@@ -240,6 +243,12 @@ class Assistant:
     def _speak_response(self, text: str, lang: str):
         """Synthesize and play speech with proper state management."""
         self.state.set_processing(False)
+
+        # Skip TTS entirely when muted
+        if self.tts_muted:
+            logger.info("[TTS] Muted — skipping speech playback.")
+            return
+
         self.state.set_speaking(True)
         self._emit_event("status", {"state": "speaking"})
 

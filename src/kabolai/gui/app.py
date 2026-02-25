@@ -141,6 +141,16 @@ class KabolaiApp(ctk.CTk):
         )
         quit_btn.pack(side="right", padx=PADDING, pady=8)
 
+        # Mute button (toggle TTS voice on/off)
+        self._muted = False
+        self._mute_btn = ctk.CTkButton(
+            bottom, text="\U0001F50A Voice", width=90, height=28,
+            font=FONT_SMALL, fg_color="#2e7d32", hover_color="#388e3c",
+            corner_radius=6,
+            command=self._on_mute_toggle,
+        )
+        self._mute_btn.pack(side="right", padx=(0, 4), pady=8)
+
         # Settings button
         settings_btn = ctk.CTkButton(
             bottom, text="\u2699 Settings", width=90, height=28,
@@ -373,6 +383,25 @@ class KabolaiApp(ctk.CTk):
                 self._assistant.state.force_reset()
             status = "ACTIVE" if new_state else "INACTIVE"
             self.after(0, lambda: self._transcript.add_entry("system", f"[{status}]"))
+
+    def _on_mute_toggle(self):
+        """Toggle TTS voice on/off."""
+        self._muted = not self._muted
+        if self._assistant:
+            self._assistant.tts_muted = self._muted
+
+        if self._muted:
+            self._mute_btn.configure(
+                text="\U0001F507 Muted",
+                fg_color="#c62828", hover_color="#e53935",
+            )
+            self._transcript.add_entry("system", "Voice muted")
+        else:
+            self._mute_btn.configure(
+                text="\U0001F50A Voice",
+                fg_color="#2e7d32", hover_color="#388e3c",
+            )
+            self._transcript.add_entry("system", "Voice unmuted")
 
     def _on_settings(self):
         """Open settings dialog."""
