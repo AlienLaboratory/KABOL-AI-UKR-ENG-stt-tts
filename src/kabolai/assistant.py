@@ -242,6 +242,15 @@ class Assistant:
         self.state.set_processing(False)
         self.state.set_speaking(True)
         self._emit_event("status", {"state": "speaking"})
+
+        # Set cooldown BEFORE playback so continuous listener
+        # ignores audio during TTS (prevents hearing own response)
+        if self.is_continuous:
+            # Estimate speech duration: ~150 words/min ≈ 2.5 words/sec
+            word_count = len(text.split())
+            estimated_duration = max(2.0, word_count / 2.5)
+            self.recorder.set_cooldown(estimated_duration + 1.0)
+
         try:
             tts = self.tts_uk if lang == "uk" else self.tts_en
             speech = tts.synthesize(text)
@@ -256,6 +265,9 @@ class Assistant:
             logger.error(f"[TTS/Playback] Error: {e}", exc_info=True)
         finally:
             self.state.set_speaking(False)
+            # Extra safety cooldown after playback finishes
+            if self.is_continuous:
+                self.recorder.set_cooldown(1.0)
 
     def speak(self, text: str, lang: str = None):
         """Speak text in the specified or current language."""
@@ -268,34 +280,47 @@ class Assistant:
         """Start always-listening mode (like Gemini/ChatGPT voice).
 
         The microphone stays open and automatically detects when you speak.
-        When speech ends (silence detected), it runs the full pipeline.
+        When speech ends (silence detected), it runs the full pipeline
+        in a SEPARATE THREAD so the listener keeps listening immediately.
         After TTS playback, a cooldown prevents hearing its own response.
         """
         logger.info("Starting continuous listening mode.")
         self._emit_event("status", {"state": "ready"})
 
         def on_speech_detected(audio_data):
-            """Called by the continuous listener when speech is detected."""
+            """Called by continuous listener — MUST return fast.
+
+            Spawns a new thread for processing so the listener
+            goes back to detecting speech immediately.
+            """
             if not self.state.is_active:
                 return
-            if not self.state.try_start_pipeline():
-                logger.debug("Pipeline busy, skipping detected speech.")
-                return
 
-            try:
-                self.state.set_processing(True)
-                self._emit_event("status", {"state": "processing"})
-                self._process(audio_data)
-                # Set cooldown so the mic doesn't hear the TTS response
-                self.recorder.set_cooldown(1.5)
-            except Exception as e:
-                logger.error(f"Continuous pipeline error: {e}", exc_info=True)
-                self._emit_event("error", {"message": str(e)})
-            finally:
-                self.state.end_pipeline()
-                self._emit_event("status", {"state": "ready"})
+            # Non-blocking: spawn a thread and return immediately
+            threading.Thread(
+                target=self._process_continuous_speech,
+                args=(audio_data,),
+                daemon=True,
+            ).start()
 
         self.recorder.start_continuous(on_speech_detected)
+
+    def _process_continuous_speech(self, audio_data):
+        """Process speech from continuous listener in a separate thread."""
+        if not self.state.try_start_pipeline():
+            logger.debug("Pipeline busy, skipping.")
+            return
+
+        try:
+            self.state.set_processing(True)
+            self._emit_event("status", {"state": "processing"})
+            self._process(audio_data)
+        except Exception as e:
+            logger.error(f"Continuous pipeline error: {e}", exc_info=True)
+            self._emit_event("error", {"message": str(e)})
+        finally:
+            self.state.end_pipeline()
+            self._emit_event("status", {"state": "ready"})
 
     def stop_continuous(self):
         """Stop always-listening mode."""

@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 # Minimum speech duration (seconds) before we consider it real speech
 # Prevents random noises from triggering the pipeline
-MIN_SPEECH_DURATION = 0.4
+MIN_SPEECH_DURATION = 0.3
 
 # Cooldown after processing (seconds) to avoid hearing the TTS response
 POST_SPEECH_COOLDOWN = 1.0

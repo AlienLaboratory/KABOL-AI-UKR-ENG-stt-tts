@@ -13,7 +13,7 @@ audio:
   channels: 1
   chunk_size: 4000
   silence_threshold: 500
-  silence_duration: 1.5
+  silence_duration: 0.8
   max_record_seconds: 30
 
 # Hotkey bindings
@@ -30,7 +30,7 @@ stt:
     model_en: "models/vosk/en"
     model_uk: "models/vosk/uk"
   whisper:
-    model_size: "medium"
+    model_size: "large-v3"
     device: "cuda"
     compute_type: "float16"
 
@@ -55,9 +55,9 @@ brain:
   engine: "ollama"
   ollama:
     base_url: "http://localhost:11434"
-    model: "qwen2.5:1.5b"
+    model: "qwen2.5:3b"
     temperature: 0.1
-    timeout: 30
+    timeout: 15
 
 # Logging
 logging:

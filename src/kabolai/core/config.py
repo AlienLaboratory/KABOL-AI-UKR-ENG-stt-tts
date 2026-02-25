@@ -29,7 +29,7 @@ class AudioConfig:
     channels: int = 1
     chunk_size: int = 4000
     silence_threshold: int = 500
-    silence_duration: float = 1.5
+    silence_duration: float = 0.8
     max_record_seconds: int = 30
 
 
