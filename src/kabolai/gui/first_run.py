@@ -41,10 +41,10 @@ def check_setup(config: AppConfig) -> dict:
     missing = {}
     profile = config.profile
 
-    # Check VOSK models
+    # Check VOSK models (they live at models/vosk/en/ and models/vosk/uk/)
     vosk_urls = VOSK_MODEL_URLS.get(profile, VOSK_MODEL_URLS.get("cpu", {}))
     for lang in ("en", "uk"):
-        model_dir = MODELS_DIR / lang
+        model_dir = MODELS_DIR / "vosk" / lang
         if not model_dir.exists() or not any(model_dir.iterdir()):
             missing[f"vosk_{lang}"] = True
 
@@ -264,7 +264,7 @@ class FirstRunWizard(ctk.CTkToplevel):
 
         url = model_info["url"]
         dir_name = model_info["dir_name"]
-        target_dir = MODELS_DIR / lang
+        target_dir = MODELS_DIR / "vosk" / lang
 
         target_dir.mkdir(parents=True, exist_ok=True)
         zip_path = MODELS_DIR / f"{dir_name}.zip"
@@ -324,11 +324,17 @@ class FirstRunWizard(ctk.CTkToplevel):
     def _update_status(self, key: str, text: str, progress: float):
         """Update a progress widget (thread-safe via after())."""
         def update():
-            if key in self._progress_widgets:
-                widgets = self._progress_widgets[key]
-                widgets["status"].configure(text=text)
-                widgets["progress"].set(progress)
-        self.after(0, update)
+            try:
+                if key in self._progress_widgets and self.winfo_exists():
+                    widgets = self._progress_widgets[key]
+                    widgets["status"].configure(text=text)
+                    widgets["progress"].set(progress)
+            except Exception:
+                pass  # Widget was destroyed — safe to ignore
+        try:
+            self.after(0, update)
+        except Exception:
+            pass  # Window already gone
 
     def _check_ollama(self):
         """Re-check if Ollama is now running."""
