@@ -1,0 +1,16 @@
+# CPU-only profile — lightweight models, no GPU needed
+profile: "cpu"
+
+stt:
+  engine: "vosk"
+  vosk:
+    model_en: "models/vosk/en"
+    model_uk: "models/vosk/uk"
+
+tts:
+  english:
+    engine: "pyttsx3"
+
+brain:
+  ollama:
+    model: "qwen2.5:1.5b"

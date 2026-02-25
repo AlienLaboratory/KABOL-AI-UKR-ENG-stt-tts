@@ -1,0 +1,67 @@
+# KA-BOL-AI Configuration
+# Override with: kabolai run --config my_config.yaml
+
+# Hardware profile: "cpu", "gpu_light", "gpu_full"
+profile: "cpu"
+
+# Starting language: "en" or "uk" (toggle at runtime with Ctrl+Shift+L)
+language: "en"
+
+# Audio settings
+audio:
+  sample_rate: 16000
+  channels: 1
+  chunk_size: 4000
+  silence_threshold: 500
+  silence_duration: 1.5
+  max_record_seconds: 30
+
+# Hotkey bindings
+hotkeys:
+  push_to_talk: "ctrl+shift+space"
+  toggle_active: "ctrl+shift+a"
+  toggle_language: "ctrl+shift+l"
+  quit: "ctrl+shift+q"
+
+# Speech-to-Text
+stt:
+  engine: "vosk"
+  vosk:
+    model_en: "models/vosk/en"
+    model_uk: "models/vosk/uk"
+  whisper:
+    model_size: "base"
+    device: "cpu"
+    compute_type: "int8"
+
+# Text-to-Speech
+tts:
+  english:
+    engine: "pyttsx3"
+    pyttsx3:
+      rate: 175
+      volume: 0.9
+    piper:
+      model: "en_US-lessac-medium"
+      model_path: "models/piper/en"
+  ukrainian:
+    engine: "ukrainian_tts"
+    voice: "Dmytro"
+    stress: "Dictionary"
+    device: "cpu"
+
+# LLM Brain
+brain:
+  engine: "ollama"
+  ollama:
+    base_url: "http://localhost:11434"
+    model: "qwen2.5:1.5b"
+    temperature: 0.1
+    timeout: 30
+
+# Logging
+logging:
+  level: "INFO"
+  file: "kabolai.log"
+  max_bytes: 5242880
+  backup_count: 3

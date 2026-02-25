@@ -1,0 +1,20 @@
+# GPU full profile (8GB+ VRAM) — best quality, fastest
+profile: "gpu_full"
+
+stt:
+  engine: "whisper"
+  whisper:
+    model_size: "small"
+    device: "cuda"
+    compute_type: "float16"
+
+tts:
+  english:
+    engine: "piper"
+    piper:
+      model: "en_US-lessac-high"
+      model_path: "models/piper/en"
+
+brain:
+  ollama:
+    model: "llama3:8b"

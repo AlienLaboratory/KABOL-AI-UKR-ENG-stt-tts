@@ -1,0 +1,19 @@
+# GPU light profile (4-6GB VRAM) — better models, faster inference
+profile: "gpu_light"
+
+stt:
+  engine: "vosk"
+  vosk:
+    model_en: "models/vosk/en"
+    model_uk: "models/vosk/uk"
+
+tts:
+  english:
+    engine: "piper"
+    piper:
+      model: "en_US-lessac-medium"
+      model_path: "models/piper/en"
+
+brain:
+  ollama:
+    model: "mistral:7b-q4_0"
