@@ -262,6 +262,51 @@ class Assistant:
         lang = lang or self.state.language
         self._speak_response(text, lang)
 
+    # ---- Continuous Listening Mode ----
+
+    def start_continuous(self):
+        """Start always-listening mode (like Gemini/ChatGPT voice).
+
+        The microphone stays open and automatically detects when you speak.
+        When speech ends (silence detected), it runs the full pipeline.
+        After TTS playback, a cooldown prevents hearing its own response.
+        """
+        logger.info("Starting continuous listening mode.")
+        self._emit_event("status", {"state": "ready"})
+
+        def on_speech_detected(audio_data):
+            """Called by the continuous listener when speech is detected."""
+            if not self.state.is_active:
+                return
+            if not self.state.try_start_pipeline():
+                logger.debug("Pipeline busy, skipping detected speech.")
+                return
+
+            try:
+                self.state.set_processing(True)
+                self._emit_event("status", {"state": "processing"})
+                self._process(audio_data)
+                # Set cooldown so the mic doesn't hear the TTS response
+                self.recorder.set_cooldown(1.5)
+            except Exception as e:
+                logger.error(f"Continuous pipeline error: {e}", exc_info=True)
+                self._emit_event("error", {"message": str(e)})
+            finally:
+                self.state.end_pipeline()
+                self._emit_event("status", {"state": "ready"})
+
+        self.recorder.start_continuous(on_speech_detected)
+
+    def stop_continuous(self):
+        """Stop always-listening mode."""
+        logger.info("Stopping continuous listening mode.")
+        self.recorder.stop_continuous()
+
+    @property
+    def is_continuous(self) -> bool:
+        """True if continuous listening mode is active."""
+        return self.recorder._continuous
+
     def check_brain(self) -> bool:
         """Check if the LLM brain is available."""
         return self.brain.is_available()
@@ -270,7 +315,8 @@ class Assistant:
         """Clean up all resources."""
         logger.info("Shutting down assistant...")
         self.state.shutdown()
-        # Stop any in-progress playback
+        # Stop continuous listener and playback
+        self.recorder.stop_continuous()
         self.player.stop()
         self.recorder.stop()
         self.stt.cleanup()

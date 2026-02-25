@@ -82,6 +82,34 @@ class KabolaiApp(ctk.CTk):
         )
         self._mic_button.pack()
 
+        # ---- Listening mode toggle (Push-to-talk vs Continuous) ----
+        mode_frame = ctk.CTkFrame(self, fg_color="transparent")
+        mode_frame.pack(fill="x", padx=PADDING * 3, pady=(0, 10))
+
+        self._mode_var = ctk.StringVar(value="push")
+        self._mode_switch = ctk.CTkSegmentedButton(
+            mode_frame,
+            values=["Push-to-Talk", "Continuous"],
+            variable=self._mode_var,
+            font=FONT_BODY,
+            fg_color=BG_PANEL,
+            selected_color=TEXT_ACCENT,
+            selected_hover_color="#0091ea",
+            unselected_color=BG_INPUT,
+            unselected_hover_color="#1a4a6e",
+            corner_radius=8,
+            command=self._on_mode_change,
+        )
+        self._mode_switch.pack(fill="x")
+        self._mode_switch.set("Push-to-Talk")
+
+        self._mode_hint = ctk.CTkLabel(
+            mode_frame,
+            text="Press Ctrl+Q or click mic to talk",
+            font=FONT_SMALL, text_color=TEXT_SECONDARY,
+        )
+        self._mode_hint.pack(pady=(4, 0))
+
         # ---- Transcript box ----
         self._transcript = TranscriptBox(self)
         self._transcript.pack(
@@ -282,6 +310,27 @@ class KabolaiApp(ctk.CTk):
 
     # ---- User Actions ----
 
+    def _on_mode_change(self, value: str):
+        """Switch between Push-to-Talk and Continuous listening modes."""
+        if self._assistant is None:
+            return
+
+        if value == "Continuous":
+            # Start always-listening mode
+            self._assistant.start_continuous()
+            self._mode_hint.configure(text="Listening always on — just speak naturally")
+            self._mic_button._hint.configure(text="Always listening...")
+            self._transcript.add_entry("system", "Continuous listening ON — just speak!")
+        else:
+            # Stop continuous, back to push-to-talk
+            self._assistant.stop_continuous()
+            hotkey = "Ctrl+Q"
+            if self._config:
+                hotkey = self._config.hotkeys.push_to_talk.replace("+", "+").title()
+            self._mode_hint.configure(text=f"Press {hotkey} or click mic to talk")
+            self._mic_button._hint.configure(text=f"Click or press {hotkey}")
+            self._transcript.add_entry("system", "Push-to-Talk mode — press Ctrl+Q to speak")
+
     def _on_mic_click(self):
         """Handle mic button click or push-to-talk hotkey."""
         if self._assistant is None:
@@ -289,7 +338,14 @@ class KabolaiApp(ctk.CTk):
         if not self._assistant.state.is_active:
             return
 
-        # Launch voice pipeline in background thread
+        # In continuous mode, mic click toggles continuous on/off
+        if self._assistant.is_continuous:
+            self._assistant.stop_continuous()
+            self._mode_switch.set("Push-to-Talk")
+            self._on_mode_change("Push-to-Talk")
+            return
+
+        # Push-to-talk: launch voice pipeline in background thread
         threading.Thread(
             target=self._assistant.handle_voice, daemon=True
         ).start()
