@@ -14,7 +14,7 @@ import customtkinter as ctk
 
 from kabolai import __version__
 from kabolai.gui.theme import (
-    BG_DARK, BG_PANEL, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_ACCENT,
+    BG_DARK, BG_PANEL, BG_INPUT, TEXT_PRIMARY, TEXT_SECONDARY, TEXT_ACCENT,
     FONT_FAMILY, FONT_TITLE, FONT_BODY, FONT_SMALL,
     WINDOW_WIDTH, WINDOW_HEIGHT, PADDING, CORNER_RADIUS,
 )
