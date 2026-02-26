@@ -126,10 +126,26 @@ class Assistant:
     # ---- Voice Pipeline ----
 
     def handle_voice(self):
-        """Record and process a voice command (push-to-talk mode)."""
+        """Record and process a voice command (push-to-talk mode).
+
+        If pipeline is busy, FORCE-CANCEL it and start fresh.
+        User pressing the mic button always wins.
+        """
         if not self.state.try_start_pipeline():
-            logger.debug("Pipeline already running, ignoring new request.")
-            return
+            # Pipeline busy — force cancel and take over
+            logger.info("[Push-to-talk] Interrupting busy pipeline...")
+            self.interrupt()
+            time.sleep(0.15)
+            # Force-reset if still stuck
+            if self.state.is_busy:
+                self.state.force_reset()
+                try:
+                    self.state._voice_lock.release()
+                except RuntimeError:
+                    pass
+            if not self.state.try_start_pipeline():
+                logger.warning("[Push-to-talk] Could not acquire pipeline after interrupt.")
+                return
 
         self._cancel.clear()
         try:

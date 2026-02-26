@@ -17,19 +17,29 @@ PLAYBACK_TIMEOUT = 30
 
 
 class AudioPlayer:
-    """Plays audio data through speakers with timeout protection."""
+    """Plays audio data through speakers with timeout and cancel support.
+
+    The _stopped event can be set externally (by assistant.interrupt())
+    to immediately halt playback mid-sentence.
+    """
 
     def __init__(self, config=None):
         self._config = config
+        self._stopped = False
 
     def _wait_with_timeout(self, timeout: float = PLAYBACK_TIMEOUT):
-        """Wait for playback to finish with a timeout guard.
+        """Wait for playback with timeout and cancel support.
 
-        Prevents sd.wait() from hanging forever if the audio device
-        has issues. Forces stop after timeout seconds.
+        Checks self._stopped every 50ms — when set, halts immediately.
+        This enables instant interrupt when the user speaks.
         """
         start = time.monotonic()
         while True:
+            # Check cancel/stop flag
+            if self._stopped:
+                sd.stop()
+                return
+
             elapsed = time.monotonic() - start
             if elapsed > timeout:
                 logger.warning(
@@ -84,11 +94,14 @@ class AudioPlayer:
             raise AudioError(f"File playback error: {e}") from e
 
     def stop(self):
-        """Stop current playback."""
+        """Stop current playback immediately."""
+        self._stopped = True
         try:
             sd.stop()
         except Exception:
             pass
+        # Reset flag after stopping
+        self._stopped = False
 
     def cleanup(self):
         """Release resources."""
