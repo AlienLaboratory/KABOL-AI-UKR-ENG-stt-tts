@@ -270,12 +270,12 @@ class Assistant:
         self.state.set_speaking(True)
         self._emit_event("status", {"state": "speaking"})
 
-        # Set cooldown BEFORE playback so continuous listener
-        # ignores audio during TTS (prevents hearing own response)
+        # Set a SHORT cooldown so continuous listener doesn't hear
+        # the very start of TTS playback. The _wait_with_timeout in
+        # the player blocks until playback finishes, so we don't need
+        # a long estimated cooldown — just enough to skip the audio start.
         if self.is_continuous:
-            word_count = len(text.split())
-            estimated_duration = max(2.0, word_count / 2.5)
-            self.recorder.set_cooldown(estimated_duration + 1.0)
+            self.recorder.set_cooldown(0.5)
 
         try:
             tts = self.tts_uk if lang == "uk" else self.tts_en
@@ -297,8 +297,9 @@ class Assistant:
             logger.error(f"[TTS/Playback] Error: {e}", exc_info=True)
         finally:
             self.state.set_speaking(False)
+            # Brief cooldown after playback to avoid hearing echo/reverb
             if self.is_continuous:
-                self.recorder.set_cooldown(1.0)
+                self.recorder.set_cooldown(0.8)
 
     def speak(self, text: str, lang: str = None):
         """Speak text in the specified or current language."""
@@ -397,6 +398,46 @@ class Assistant:
     def is_continuous(self) -> bool:
         """True if continuous listening mode is active."""
         return self.recorder._continuous
+
+    def reset(self):
+        """Emergency reset — clear all state, recover from any hang.
+
+        Called by the GUI Reset button. Stops everything, clears all
+        locks and flags, and restarts continuous if it was active.
+        """
+        logger.info("[Reset] Emergency reset triggered.")
+        was_continuous = self.is_continuous
+
+        # Cancel any running pipeline
+        self._cancel.set()
+        self.player.stop()
+
+        # Force-clear all state
+        self.state.force_reset()
+        try:
+            self.state._voice_lock.release()
+        except RuntimeError:
+            pass
+
+        # Clear pending audio
+        with self._pending_lock:
+            self._pending_audio = None
+
+        # Clear cooldown
+        self.recorder._cooldown_until = 0
+
+        # Stop and restart continuous if needed
+        self.recorder.stop_continuous()
+        if was_continuous:
+            time.sleep(0.2)
+            self._cancel.clear()
+            self.start_continuous()
+            logger.info("[Reset] Continuous listening restarted.")
+        else:
+            self._cancel.clear()
+
+        self._emit_event("status", {"state": "ready"})
+        logger.info("[Reset] Complete — assistant ready.")
 
     def check_brain(self) -> bool:
         """Check if the LLM brain is available."""

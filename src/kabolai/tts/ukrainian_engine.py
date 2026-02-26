@@ -1,7 +1,7 @@
 """Ukrainian TTS using robinhad/ukrainian-tts (ESPnet v2).
 
-Has timeout protection — if synthesis takes more than 10s, it gives up
-rather than hanging the entire pipeline.
+First run downloads stanza + TTS model (~1-2 min). After that it's fast.
+Has timeout protection and lazy retry if first init fails.
 """
 
 import io
@@ -15,14 +15,20 @@ from kabolai.tts.base import TTSEngine, SpeechResult
 
 logger = logging.getLogger(__name__)
 
-# Maximum seconds for Ukrainian TTS synthesis
-UK_TTS_TIMEOUT = 10
+# Maximum seconds for synthesis of a single utterance
+UK_TTS_TIMEOUT = 15
+
+# Maximum seconds for initial model loading (first run downloads ~200MB)
+UK_INIT_TIMEOUT = 180
 
 
 class UkrainianTTS(TTSEngine):
     """Ukrainian TTS using the ukrainian-tts package.
 
-    Runs synthesis in a separate thread with timeout protection.
+    On first run, downloads stanza Ukrainian models + TTS model (~200MB).
+    This can take 1-2 minutes. After that, init takes ~5 seconds.
+
+    If init fails/times out, it retries on next synthesize() call.
     """
 
     def __init__(self, voice: str = "Dmytro", stress: str = "Dictionary", device: str = "cpu"):
@@ -32,11 +38,30 @@ class UkrainianTTS(TTSEngine):
         self._tts = None
         self._voices_enum = None
         self._stress_enum = None
-        self._init_error: Optional[str] = None
-        self._initialize()
+        self._init_attempted = False
+        self._init_lock = threading.Lock()
 
-    def _initialize(self):
-        """Initialize the TTS engine with timeout protection."""
+    def _ensure_initialized(self) -> bool:
+        """Lazy init — only loads model when first needed. Returns True if ready."""
+        if self._tts is not None:
+            return True
+
+        with self._init_lock:
+            # Double-check after acquiring lock
+            if self._tts is not None:
+                return True
+
+            if self._init_attempted:
+                return False  # Already failed, don't retry every call
+
+            self._init_attempted = True
+            return self._do_init()
+
+    def _do_init(self) -> bool:
+        """Actually initialize TTS. Returns True on success."""
+        logger.info(
+            "Initializing Ukrainian TTS (first run downloads models, may take 1-2 min)..."
+        )
         result_q = queue.Queue()
 
         def _init_worker():
@@ -53,36 +78,42 @@ class UkrainianTTS(TTSEngine):
         t.start()
 
         try:
-            status, *args = result_q.get(timeout=60)
+            status, *args = result_q.get(timeout=UK_INIT_TIMEOUT)
         except queue.Empty:
-            self._init_error = "Ukrainian TTS init timed out (60s). Model may be downloading."
-            logger.warning(self._init_error)
-            return
+            logger.error(
+                f"Ukrainian TTS init timed out after {UK_INIT_TIMEOUT}s. "
+                f"Model may still be downloading. Try again later."
+            )
+            self._init_attempted = False  # Allow retry
+            return False
 
         if status == "import_error":
-            raise TTSError(
-                "ukrainian-tts not installed. Run: "
-                "pip install git+https://github.com/robinhad/ukrainian-tts.git"
+            logger.error(
+                "ukrainian-tts not installed. "
+                "Run: pip install git+https://github.com/robinhad/ukrainian-tts.git"
             )
+            return False
         elif status == "error":
-            raise TTSError(f"Failed to initialize Ukrainian TTS: {args[0]}")
+            logger.error(f"Ukrainian TTS init failed: {args[0]}")
+            self._init_attempted = False  # Allow retry
+            return False
         else:
             self._tts = args[0]
             self._voices_enum = args[1]
             self._stress_enum = args[2]
             logger.info(
-                f"Ukrainian TTS initialized: voice={self._voice_name}, "
+                f"✓ Ukrainian TTS ready: voice={self._voice_name}, "
                 f"stress={self._stress_name}, device={self._device}"
             )
+            return True
 
     def synthesize(self, text: str) -> SpeechResult:
         """Synthesize Ukrainian text to WAV audio (with timeout)."""
         if not text.strip():
             return SpeechResult(audio_data=b"", sample_rate=22050)
 
-        if self._tts is None:
-            if self._init_error:
-                logger.warning(f"Ukrainian TTS unavailable: {self._init_error}")
+        if not self._ensure_initialized():
+            logger.warning("[Ukrainian TTS] Not available — returning silence.")
             return SpeechResult(audio_data=b"", sample_rate=22050)
 
         result_q = queue.Queue()
@@ -109,14 +140,18 @@ class UkrainianTTS(TTSEngine):
         try:
             status, data = result_q.get(timeout=UK_TTS_TIMEOUT)
         except queue.Empty:
-            logger.error(f"Ukrainian TTS timed out after {UK_TTS_TIMEOUT}s")
+            logger.error(f"Ukrainian TTS synthesis timed out after {UK_TTS_TIMEOUT}s")
             return SpeechResult(audio_data=b"", sample_rate=22050)
 
         if status == "error":
             logger.error(f"Ukrainian TTS synthesis failed: {data}")
             return SpeechResult(audio_data=b"", sample_rate=22050)
 
-        logger.debug(f"Ukrainian TTS: '{text[:50]}...' -> {len(data)} bytes")
+        if len(data) < 100:
+            logger.warning(f"Ukrainian TTS returned suspiciously small audio: {len(data)} bytes")
+            return SpeechResult(audio_data=b"", sample_rate=22050)
+
+        logger.info(f"[Ukrainian TTS] '{text[:40]}' -> {len(data)} bytes")
         return SpeechResult(audio_data=data, sample_rate=22050, format="wav")
 
     def get_available_voices(self) -> list[str]:

@@ -151,6 +151,15 @@ class KabolaiApp(ctk.CTk):
         )
         self._mute_btn.pack(side="right", padx=(0, 4), pady=8)
 
+        # Reset button (emergency recovery)
+        reset_btn = ctk.CTkButton(
+            bottom, text="\u21BB Reset", width=75, height=28,
+            font=FONT_SMALL, fg_color="#e65100", hover_color="#f57c00",
+            corner_radius=6,
+            command=self._on_reset,
+        )
+        reset_btn.pack(side="right", padx=(0, 4), pady=8)
+
         # Settings button
         settings_btn = ctk.CTkButton(
             bottom, text="\u2699 Settings", width=90, height=28,
@@ -348,11 +357,13 @@ class KabolaiApp(ctk.CTk):
         if not self._assistant.state.is_active:
             return
 
-        # In continuous mode, mic click toggles continuous on/off
+        # In continuous mode, mic click is a no-op — user just speaks.
+        # Use the mode switch to exit continuous mode.
         if self._assistant.is_continuous:
-            self._assistant.stop_continuous()
-            self._mode_switch.set("Push-to-Talk")
-            self._on_mode_change("Push-to-Talk")
+            # If pipeline is busy, interrupt it so user can speak again
+            if self._assistant.state.is_busy:
+                self._assistant.interrupt()
+                self._transcript.add_entry("system", "Interrupted — speak now")
             return
 
         # Push-to-talk: launch voice pipeline in background thread
@@ -402,6 +413,16 @@ class KabolaiApp(ctk.CTk):
                 fg_color="#2e7d32", hover_color="#388e3c",
             )
             self._transcript.add_entry("system", "Voice unmuted")
+
+    def _on_reset(self):
+        """Emergency reset — force-clear all state, recover from any hang."""
+        if self._assistant is None:
+            return
+
+        self._assistant.reset()
+        self._transcript.add_entry("system", "Reset complete — ready")
+        self._status_banner.set_status("ready", self._get_language())
+        self._mic_button.set_state("ready")
 
     def _on_settings(self):
         """Open settings dialog."""
